@@ -283,6 +283,74 @@ def test_stats_json_skips_invalid_timestamps(temp_db):
     assert data["time_range"]["latest"] == datetime.fromtimestamp(base + 50).isoformat()
 
 
+def test_stats_json_projectless_unfinished_session(temp_db):
+    base = int(time.time())
+    # Earlier completed project-less session.
+    cmd = Command(timestamp=base + 150, command="ls", exit_code=0, session_id=1, project_id=None)
+    completed = Session(
+        id=1, start_time=base + 100, end_time=base + 200,
+        duration_seconds=100, project_id=None, commands=[cmd],
+    )
+    temp_db.save_data([], [completed], [cmd])
+
+    # Later *unfinished* project-less session: end_time is NULL, so it must not
+    # be dropped when computing the Other activity window.
+    conn = temp_db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO sessions (start_time, end_time, duration_seconds, project_id) "
+            "VALUES (?, NULL, NULL, NULL)",
+            (base + 300,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    data = stats_json(temp_db)
+
+    other = next(p for p in data["projects"] if p["name"] == "Other")
+    assert other["id"] is None
+    assert other["commands_count"] == 1
+    assert other["sessions_count"] == 2
+    # The unfinished session start_time must bound last_seen: proves a NULL
+    # end_time did not cause the later start_time to be ignored.
+    assert other["first_seen"] == datetime.fromtimestamp(base + 100).isoformat()
+    assert other["last_seen"] == datetime.fromtimestamp(base + 300).isoformat()
+
+
+def test_stats_json_projectless_invalid_timestamp(temp_db):
+    base = int(time.time())
+    cmd = Command(timestamp=base + 10, command="ls", exit_code=0, session_id=1, project_id=None)
+    good = Session(
+        id=1, start_time=base, end_time=base + 50, duration_seconds=50,
+        project_id=None, commands=[cmd],
+    )
+    temp_db.save_data([], [good], [cmd])
+
+    # Out-of-range timestamp (same shape that insights.analyze_all already guards
+    # against) must be filtered out before the Other bounds are selected: without
+    # filtering it would become the MIN and yield first_seen=None.
+    conn = temp_db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO sessions (start_time, end_time, duration_seconds, project_id) "
+            "VALUES (?, NULL, NULL, NULL)",
+            (-999999999999,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    data = stats_json(temp_db)  # Must not raise.
+
+    other = next(p for p in data["projects"] if p["name"] == "Other")
+    assert other["commands_count"] == 1
+    assert other["sessions_count"] == 2
+    # The invalid outlier must not blank or override the valid activity window.
+    assert other["first_seen"] == datetime.fromtimestamp(base).isoformat()
+    assert other["last_seen"] == datetime.fromtimestamp(base + 50).isoformat()
+
+
 @pytest.fixture(autouse=True)
 def clear_cache():
     _LANG_CACHE.clear()

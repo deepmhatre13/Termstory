@@ -217,15 +217,22 @@ def project_breakdown_json(db: Database):
         )
         session_stats = {row[0]: (row[1], row[2] or 0) for row in cursor.fetchall()}
 
-        # First/last activity for project-less rows (mirrors project_breakdown).
+        # Project-less activity bounds. Raw timestamps are collected via UNION ALL
+        # rather than SQL MIN/MAX for two reasons: an unfinished session (end_time
+        # IS NULL) must still contribute its start_time to last_seen, and any
+        # invalid outlier must be discarded by _safe_datetime_from_ts() *before*
+        # the bounds are selected so it cannot mask valid activity.
         cursor.execute(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM commands WHERE project_id IS NULL"
+            "SELECT ts FROM ("
+            " SELECT timestamp AS ts FROM commands WHERE project_id IS NULL"
+            " UNION ALL"
+            " SELECT start_time AS ts FROM sessions WHERE project_id IS NULL"
+            " UNION ALL"
+            " SELECT end_time AS ts FROM sessions WHERE end_time IS NOT NULL"
+            "   AND project_id IS NULL"
+            ") AS activity"
         )
-        c_min, c_max = cursor.fetchone()
-        cursor.execute(
-            "SELECT MIN(start_time), MAX(end_time) FROM sessions WHERE project_id IS NULL"
-        )
-        s_min, s_max = cursor.fetchone()
+        null_activity_rows = cursor.fetchall()
     finally:
         conn.close()
 
@@ -246,7 +253,17 @@ def project_breakdown_json(db: Database):
     null_sess, null_dur = session_stats.get(None, (0, 0))
     null_cmds = cmd_counts.get(None, 0)
     if null_cmds or null_sess or null_dur:
-        times = [t for t in (c_min, c_max, s_min, s_max) if t is not None]
+        # Filter project-less timestamps through _safe_datetime_from_ts() so
+        # an invalid outlier is discarded *before* the bounds are selected --
+        # SQL MIN/MAX would let it mask all valid activity. The raw numeric
+        # timestamps (matching the real-project first_seen/last_seen type)
+        # are retained and min/maxed over the valid values only, keeping this
+        # structure JSON-compatible without re-running SQL bounds.
+        valid_null_ts = [
+            ts
+            for (ts,) in null_activity_rows
+            if _safe_datetime_from_ts(ts) is not None
+        ]
         entries[None] = {
             "name": "Other",
             "id": None,
@@ -254,8 +271,8 @@ def project_breakdown_json(db: Database):
             "commands_count": null_cmds,
             "total_duration": null_dur,
             "sessions_count": null_sess,
-            "first_seen": min(times) if times else None,
-            "last_seen": max(times) if times else None,
+            "first_seen": min(valid_null_ts) if valid_null_ts else None,
+            "last_seen": max(valid_null_ts) if valid_null_ts else None,
         }
 
     def _sort_key(p_id):
