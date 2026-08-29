@@ -329,6 +329,31 @@ def test_start_sleep_daemon_reclaims_stale_pid_file(tmp_path, monkeypatch):
     assert pid_file.read_text().strip() == str(os.getpid())
 
 
+def test_start_sleep_daemon_defers_to_inprogress_claim(tmp_path, monkeypatch):
+    """A PID file that exists but is empty means another invocation has just
+    claimed ownership and has not written its placeholder PID yet. Treating that
+    as 'stale' and deleting it would let a second invocation also spawn the
+    daemon (the double-spawn race seen on POSIX CI). The listener must defer and
+    leave the claim untouched."""
+    import subprocess
+    import termstory.reminder as reminder
+
+    monkeypatch.setattr(reminder, "get_app_dir", lambda name: str(tmp_path))
+    pid_file = tmp_path / "sleep_daemon.pid"
+    # Simulate the winner having created the file but not yet written its PID.
+    pid_file.write_text("")
+
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: calls.append(args))
+
+    reminder.start_sleep_daemon("dummy.db")
+
+    # The in-progress claim must win: no new daemon is spawned...
+    assert calls == []
+    # ...and the winner's claim is neither deleted nor overwritten.
+    assert pid_file.read_text() == ""
+
+
 def test_start_sleep_daemon_concurrent_invocations_spawn_once(tmp_path, monkeypatch):
     import threading
     from unittest.mock import MagicMock

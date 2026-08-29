@@ -559,14 +559,26 @@ def start_sleep_daemon(db_path: str):
         try:
             fd = os.open(pid_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
         except FileExistsError:
-            # Another invocation already owns the daemon. If its PID is alive it
-            # is (or is about to become) the running daemon — defer to it.
+            # Another invocation already owns the daemon. Read its PID: if it is
+            # alive (or about to become the running daemon) we defer to it. The
+            # winner writes its placeholder PID immediately after creating the
+            # file, so an empty/unreadable file is a *claim still being
+            # initialised*, never a stale leftover — deleting it out from under
+            # the winner would let two invocations both spawn a daemon.
             try:
                 with open(pid_file, "r") as f:
-                    pid = int(f.read().strip())
+                    raw = f.read().strip()
+                pid = int(raw)
+            except (ValueError, OSError):
+                # Unparsable or unreadable: a concurrent claim is in progress,
+                # or the daemon never made it far enough to record a PID. In the
+                # latter case the daemon wrote no PID at all, so there is nothing
+                # to stale-reclaim here — defer to whoever owns the file.
+                return
+            try:
                 os.kill(pid, 0)
                 return  # Already running
-            except (ValueError, OSError):
+            except OSError:
                 if attempt == 0:
                     # Stale PID file (a daemon died without cleaning up).
                     # Reclaim ownership on the next attempt.
