@@ -538,6 +538,16 @@ def consolidate_sleep_contexts(db, force: bool = False) -> int:
     return consolidated_count
 
 
+# Upper bound (seconds) on how long a claim is allowed to sit empty before we
+# treat it as abandoned and reclaim it. The claim window — ``os.open`` with
+# ``O_CREAT | O_EXCL`` creating the file, then ``os.write`` recording the
+# placeholder PID — is a couple of syscalls. Any empty file younger than this
+# is a live in-progress claim (defer to it, never delete it out from under the
+# winner); only an empty file that has outlived this bound is a claim whose
+# creator died before publishing its PID, and is safe to reclaim.
+_DAEMON_CLAIM_GRACE_SECONDS = 10.0
+
+
 def start_sleep_daemon(db_path: str):
     """Spawns the sleep daemon in the background if it's not already running.
 
@@ -548,6 +558,14 @@ def start_sleep_daemon(db_path: str):
     just-started) daemon, which later overwrites the placeholder PID with its
     own. A stale PID file (a daemon that died without cleaning up) is reclaimed
     so the daemon can be restarted.
+
+    An empty PID file (the winner created it but has not published its
+    placeholder PID yet) is treated as a live in-progress claim while it is
+    fresh, so concurrent invocations defer to it rather than double-spawn. If
+    the creator dies between creating the file and publishing its PID, the file
+    is left empty forever; once it is older than ``_DAEMON_CLAIM_GRACE_SECONDS``
+    that empty claim is deemed abandoned and reclaimed so the daemon can be
+    started again without manual cleanup.
     """
     import sys
     import subprocess
@@ -560,20 +578,44 @@ def start_sleep_daemon(db_path: str):
             fd = os.open(pid_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
         except FileExistsError:
             # Another invocation already owns the daemon. Read its PID: if it is
-            # alive (or about to become the running daemon) we defer to it. The
-            # winner writes its placeholder PID immediately after creating the
-            # file, so an empty/unreadable file is a *claim still being
-            # initialised*, never a stale leftover — deleting it out from under
-            # the winner would let two invocations both spawn a daemon.
+            # alive (or about to become the running daemon) we defer to it.
             try:
                 with open(pid_file, "r") as f:
                     raw = f.read().strip()
                 pid = int(raw)
             except (ValueError, OSError):
-                # Unparsable or unreadable: a concurrent claim is in progress,
-                # or the daemon never made it far enough to record a PID. In the
-                # latter case the daemon wrote no PID at all, so there is nothing
-                # to stale-reclaim here — defer to whoever owns the file.
+                # Empty or unreadable PID: the winner created the file but has
+                # not yet recorded its placeholder PID. That can be one of two
+                # things:
+                #   * a live in-progress claim (creator between os.open and
+                #     os.write) — deleting it would let a second invocation also
+                #     spawn a daemon, so we defer while it is fresh; or
+                #   * an abandoned claim (creator died before publishing its PID)
+                #     — the file stays empty forever and we must reclaim it, or
+                #     every later invocation defers until someone removes it by
+                #     hand. Age is the tie-break: any empty file older than the
+                #     grace bound is far beyond the sub-millisecond claim window
+                #     and is safe to reclaim.
+                try:
+                    claim_age = time.time() - os.path.getmtime(pid_file)
+                except OSError:
+                    # The file vanished under us; let the loop retry cleanly.
+                    continue
+                if attempt == 0 and claim_age > _DAEMON_CLAIM_GRACE_SECONDS:
+                    # Abandoned claim left by a creator that died before it
+                    # published its PID. Reclaim ownership on the next attempt;
+                    # attempt 1's O_EXCL open either wins the (now-free) name or
+                    # finds a fresh live claim and defers via the re-check above.
+                    try:
+                        os.remove(pid_file)
+                    except OSError:
+                        logger.exception(
+                            "Failed to remove abandoned sleep daemon PID file %s",
+                            pid_file,
+                        )
+                    continue
+                # A live in-progress claim (or attempt 1 after a failed reclaim):
+                # defer to whoever owns the file.
                 return
             try:
                 os.kill(pid, 0)

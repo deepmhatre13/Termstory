@@ -354,6 +354,35 @@ def test_start_sleep_daemon_defers_to_inprogress_claim(tmp_path, monkeypatch):
     assert pid_file.read_text() == ""
 
 
+def test_start_sleep_daemon_reclaims_abandoned_inprogress_claim(tmp_path, monkeypatch):
+    """If a creator dies after os.open(O_EXCL) creates the PID file but before
+    os.write publishes its PID, the file is left empty forever. Once that empty
+    claim is older than the grace bound it must be reclaimed so the daemon can
+    be started again — otherwise every later invocation defers indefinitely.
+    This is the bounded-recovery counterpart of
+    test_start_sleep_daemon_defers_to_inprogress_claim."""
+    import subprocess
+    import termstory.reminder as reminder
+
+    monkeypatch.setattr(reminder, "get_app_dir", lambda name: str(tmp_path))
+    pid_file = tmp_path / "sleep_daemon.pid"
+    # Simulate a creator that died between creating the file and writing its PID:
+    # the file is empty and has sat untouched well past the grace bound.
+    pid_file.write_text("")
+    old = time.time() - reminder._DAEMON_CLAIM_GRACE_SECONDS - 60
+    os.utime(pid_file, (old, old))
+
+    calls = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: calls.append(args))
+
+    reminder.start_sleep_daemon("dummy.db")
+
+    # The abandoned claim is recovered: exactly one daemon is spawned...
+    assert len(calls) == 1
+    # ...and the PID file now holds our live PID, not the leftover empty file.
+    assert pid_file.read_text().strip() == str(os.getpid())
+
+
 def test_start_sleep_daemon_concurrent_invocations_spawn_once(tmp_path, monkeypatch):
     import threading
     from unittest.mock import MagicMock
